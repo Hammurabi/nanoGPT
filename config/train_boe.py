@@ -10,7 +10,7 @@ dataset = 'shakespeare'
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
 batch_size = 2
-block_size = 64
+block_size = 768
 gradient_accumulation_steps = 1
 
 # this makes total number of tokens be 300B
@@ -27,13 +27,16 @@ weight_decay = 1e-1
     
 n_layer: int = 1
 n_head: int = 1
-n_embd: int = 1536
+n_embd: int = 96
 dropout: float = 0.1
 use_moe = True
-num_experts = 96*8
-num_experts_per_tok = 8
-device = 'mps' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+num_experts = 384*2
+num_experts_per_tok = 6
+device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 compile = False # use PyTorch 2.0 to compile the model to be faster
 always_save_checkpoint = False # if True, always save a checkpoint after each eval
 # dtype = 'bfloat16' # 'float32', 'float16', 'bfloat16'
 # ptdtype = 'bfloat16' # 'float32', 'float16', 'bfloat16'
+
+import torch
+print(torch.__version__)
