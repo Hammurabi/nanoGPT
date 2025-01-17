@@ -96,7 +96,7 @@ class Block(nn.Module):
         print(config.use_moe)
         if config.use_moe:
             print("using mixture of experts")
-            self.ff = MoE(config)
+            self.ff = StackedMoE(config)
         else:
             print("using regular MLP")
             self.ff = MLP(config)
@@ -143,6 +143,97 @@ class Neuron(nn.Module):
         x = self.dropout(x)
         return x
 
+class StackedMoE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.n_embd = config.n_embd
+        self.p_expert = config.p_expert
+        self.bias_flag = config.bias
+        
+        # Stack parameters for all experts
+        self.c_fc_weight = nn.Parameter(
+            torch.empty(self.num_experts, config.n_embd, config.p_expert))
+        if self.bias_flag:
+            self.c_fc_bias = nn.Parameter(
+                torch.empty(self.num_experts, config.p_expert))
+        else:
+            self.register_parameter('c_fc_bias', None)
+
+        self.c_proj_weight = nn.Parameter(
+            torch.empty(self.num_experts, config.p_expert, config.n_embd))
+        if self.bias_flag:
+            self.c_proj_bias = nn.Parameter(
+                torch.empty(self.num_experts, config.n_embd))
+        else:
+            self.register_parameter('c_proj_bias', None)
+
+        self.gelu = nn.GELU()
+        self.dropout = nn.Dropout(config.dropout)
+
+        self.gate = nn.Linear(config.n_embd, config.num_experts, bias=False)
+        self.num_experts_per_tok = config.num_experts_per_tok
+
+        # Initialize weights (this should mirror Neuron initialization)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Initialize weights similarly to how each Neuron would be initialized
+        nn.init.kaiming_uniform_(self.c_fc_weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.c_proj_weight, a=math.sqrt(5))
+        if self.bias_flag:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(
+                self.c_fc_weight[0])
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.c_fc_bias, -bound, bound)
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(
+                self.c_proj_weight[0])
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.c_proj_bias, -bound, bound)
+    def forward(self, x):
+        orig_shape = x.shape
+        x = x.view(-1, x.shape[-1])
+
+        scores = self.gate(x)
+        expert_weights, expert_indices = torch.topk(
+            scores, self.num_experts_per_tok, dim=-1)
+        expert_weights = expert_weights.softmax(dim=-1)
+        flat_expert_indices = expert_indices.view(-1)
+
+        # Expand tokens for multiple experts assignment
+        x = x.repeat_interleave(self.num_experts_per_tok, dim=0)
+        y = torch.empty_like(x, dtype=torch.bfloat16, device=x.device)
+
+        active_expert_ids = torch.unique(flat_expert_indices)
+
+        for i in active_expert_ids:
+            mask = (flat_expert_indices == i)
+            if mask.sum() == 0:
+                continue
+            xi = x[mask]  # Tokens assigned to expert i
+
+            # Use stacked weights for expert i
+            # First linear transformation c_fc
+            fc_weight = self.c_fc_weight[i]
+            fc_bias = self.c_fc_bias[i] if self.bias_flag else 0
+            h = xi @ fc_weight + fc_bias
+            h = self.gelu(h)
+
+            # Second linear transformation c_proj
+            proj_weight = self.c_proj_weight[i]
+            proj_bias = self.c_proj_bias[i] if self.bias_flag else 0
+            out = h @ proj_weight + proj_bias
+            out = self.dropout(out)
+
+            # Store results
+            y[mask] = out.to(dtype=y.dtype)
+
+        # Reshape and combine outputs with expert weights
+        y = (y.view(*expert_weights.shape, -1) *
+            expert_weights.unsqueeze(-1)).sum(dim=1)
+        return y.view(*orig_shape)
+    
+
 
 class MoE(nn.Module):
     def __init__(
@@ -167,12 +258,53 @@ class MoE(nn.Module):
 
         x = x.repeat_interleave(self.num_experts_per_tok, dim=0)
         y = torch.empty_like(x, dtype=torch.bfloat16, device=x.device)
+        active_expert_ids = torch.unique(flat_expert_indices)
+
         for i, expert in enumerate(self.experts):
             # y[flat_expert_indices == i] = expert(x[flat_expert_indices == i])
             # Identify indices where this expert should process data
             mask = (flat_expert_indices == i)
             # Compute expert output for the selected inputs
             expert_output = expert(x[mask])
+            # Convert expert output to the same dtype as destination `y`
+            expert_output = expert_output.to(dtype=y.dtype)
+            # Assign the converted output back to y at the masked indices
+            y[mask] = expert_output
+        y = (y.view(*expert_weights.shape, -1) *
+             expert_weights.unsqueeze(-1)).sum(dim=1)
+        return y.view(*orig_shape)
+
+class MoEActiveOnly(nn.Module):
+    def __init__(
+        self,
+        config,
+    ):
+        super().__init__()
+        self.experts = nn.ModuleList([Neuron(config)
+                                     for i in range(config.num_experts)])
+        self.gate = nn.Linear(config.n_embd, config.num_experts, bias=False)
+        self.num_experts_per_tok = config.num_experts_per_tok
+
+    def forward(self, x):
+        orig_shape = x.shape
+        x = x.view(-1, x.shape[-1])
+
+        scores = self.gate(x)
+        expert_weights, expert_indices = torch.topk(
+            scores, self.num_experts_per_tok, dim=-1)
+        expert_weights = expert_weights.softmax(dim=-1)
+        flat_expert_indices = expert_indices.view(-1)
+
+        x = x.repeat_interleave(self.num_experts_per_tok, dim=0)
+        y = torch.empty_like(x, dtype=torch.bfloat16, device=x.device)
+        active_expert_ids = torch.unique(flat_expert_indices)
+
+        for i in active_expert_ids:
+            # y[flat_expert_indices == i] = expert(x[flat_expert_indices == i])
+            # Identify indices where this expert should process data
+            mask = (flat_expert_indices == i)
+            # Compute expert output for the selected inputs
+            expert_output = self.experts[i](x[mask])
             # Convert expert output to the same dtype as destination `y`
             expert_output = expert_output.to(dtype=y.dtype)
             # Assign the converted output back to y at the masked indices
@@ -197,10 +329,11 @@ class GPTConfig:
     use_moe: bool = True
     num_experts: int = 16384
     num_experts_per_tok: int = 128
-    p_expert: int = 16 # an expert is a perceptron
+    p_expert: int = 2 # an expert is a perceptron
+    softmax_order: str = 'softmax_topk'
+    batch_size: int = 64
 
 class GPT(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         assert config.vocab_size is not None

@@ -147,7 +147,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout, use_moe=use_moe, num_experts=num_experts, num_experts_per_tok=num_experts_per_tok) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, use_moe=use_moe, num_experts=num_experts, num_experts_per_tok=num_experts_per_tok, batch_size=batch_size) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
